@@ -353,6 +353,38 @@ node /org/freedesktop/sysupdate1/target/host {
       by <varname>GetVersion()</varname>).
       For now, this method only works with the <literal>host</literal> target.</para>
 
+      <para><function>ListFeatures()</function> returns a list of this target's optional features, by ID.
+      If the target has no optional features, the method returns an empty array.</para>
+
+      <para><function>DescribeFeature()</function> returns all known information about a given optional
+      feature.
+      This method returns a JSON object with the following known keys:
+      <literal>name</literal> is a string that contains the feature's name,
+      <literal>description</literal> is a string that contains a user-presentable description that identifies
+      this feature,
+      <literal>enabled</literal> is a boolean that indicates whether or not this feature is enabled,
+      <literal>documentation_url</literal> is a string that contains a user-presentable HTTP/HTTPS URL to
+      documentation about this feature,
+      <literal>appstream_url</literal> is a string that contains an HTTP/HTTPS URL to an
+      <ulink url="https://wwww.freedesktop.org/software/appstream/docs/chap-CatalogData.html">appstream catalog</ulink>
+      XML file containing reach metadata about this feature,
+      and <literal>transfers</literal> is an array of strings that list which transfer definitions belong to
+      this feature.
+      Only <literal>name</literal> and <literal>enabled</literal> are guaranteed to be present; all other
+      keys are optional.</para>
+
+      <para><function>SetFeatureEnabled()</function> writes an appropriate drop-in file to enable or disable
+      the specified optional feature.
+      The feature does not have to exist; this allows for graceful handling of masked features, and for
+      preemptive decisions to be made about features that are planned to appear in future releases of the OS.
+      The drop-in will have a filename of <literal>50-systemd-sysupdate-enabled.conf</literal>.
+      This method only changes configuration files; to actually apply the changes, clients will need to
+      call <function>Update()</function>.
+      Depending on the exact needs of the client, it can choose to update the system to the latest available
+      version, or it can extend the newest existing installation in-place (by passing in the version returned
+      by <varname>GetVersion()</varname>).
+      For now, this method only works with the <literal>host</literal> target.</para>
+
     </refsect2>
 
     <refsect2>
@@ -407,13 +439,16 @@ node /org/freedesktop/sysupdate1/target/host {
       <interfacename>org.freedesktop.sysupdate1.vacuum</interfacename>. By default, this action requires
       administrator authentication.</para>
 
-      <para><function>SetFeatureEnabled()</function> uses the polkit action
-      <interfacename>org.freedesktop.sysupdate1.manage-features</interfacename>. By default, this action
-      requires administrator authentication.</para>
+      <!-- TODO: When Tom documents that GetAppstream() and GetVersion() don't do any auth checks, we can
+                 add ListFeatures() and DescribeFeature(). -->
 
       <para><function>GetAppStream()</function>, <function>GetVersion()</function>,
       <function>ListFeatures()</function>, and <function>DescribeFeature()</function>
       are unauthenticated and may be called by anybody.</para>
+
+      <para><function>SetFeatureEnabled()</function> uses the polkit action
+      <interfacename>org.freedesktop.sysupdate1.manage-features</interfacename>. By default, this action
+      requires administrator authentication.</para>
 
       <para>All methods called on this interface expose additional variables to the polkit rules.
       <literal>class</literal> contains the class of the Target being acted upon, and <literal>name</literal>

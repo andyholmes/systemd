@@ -1438,6 +1438,138 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
         return sd_bus_reply_method_return(msg, NULL);
 }
 
+
+static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        _cleanup_free_ char *target_arg = NULL;
+        _cleanup_strv_free_ char **features = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        Target *t = ASSERT_PTR(userdata);
+        sd_json_variant *v;
+        int r;
+
+        assert(msg);
+
+        r = target_get_argument(t, &target_arg);
+        if (r < 0)
+                return r;
+
+        r = sysupdate_run_simple(&json, "features", target_arg, NULL);
+        if (r < 0)
+                return r;
+
+        v = sd_json_variant_by_key(json, "features");
+        if (!v)
+                return -EINVAL;
+        r = sd_json_variant_strv(v, &features);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_new_method_return(msg, &reply);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append_strv(reply, t->appstream);
+        if (r < 0)
+                return r;
+
+        return sd_bus_send(NULL, reply, NULL);
+}
+
+static int target_method_describe_feature(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Target *t = ASSERT_PTR(userdata);
+        _cleanup_(job_freep) Job *j = NULL;
+        const char *feature;
+        int offline, r;
+
+        assert(msg);
+
+        r = sd_bus_message_read(msg, "sb", &feature, &offline);
+        if (r < 0)
+                return r;
+
+        if (isempty(feature))
+                return -EINVAL;
+
+        r = job_new(JOB_DESCRIBE_FEATURE, t, msg, target_method_describe_finish, &j);
+        if (r < 0)
+                return r;
+
+        j->feature = strdup(feature);
+        if (!j->feature)
+                return log_oom();
+
+        j->offline = offline;
+
+        r = job_start(j);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to start job: %m");
+        TAKE_PTR(j); /* Avoid job from being killed & freed */
+
+        return 1;
+}
+
+static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        _cleanup_free_ char *feature_ext = NULL;
+        Target *t = ASSERT_PTR(userdata);
+        const char *feature;
+        int enabled, r;
+
+        assert(msg);
+
+        if (t->class != TARGET_HOST)
+                return sd_bus_reply_method_errorf(msg,
+                                                  SD_BUS_ERROR_NOT_SUPPORTED,
+                                                  "For now, features can only be managed on the host system.");
+
+        r = sd_bus_message_read(msg, "sb", &feature, &enabled);
+        if (r < 0)
+                return r;
+
+        if (!endswith(feature, ".feature")) {
+                feature_ext = strjoin(feature, ".feature");
+                if (!feature_ext)
+                        return -ENOMEM;
+                feature = feature_ext;
+        }
+
+        if (!filename_is_valid(feature))
+                return sd_bus_reply_method_errorf(msg,
+                                                  SD_BUS_ERROR_INVALID_ARGS,
+                                                  "The specified feature is invalid");
+
+        const char *details[] = {
+                "class", target_class_to_string(t->class),
+                "name", t->name,
+                "feature", feature,
+                "enabled", true_false(enabled),
+                NULL
+        };
+
+        r = bus_verify_polkit_async(
+                msg,
+                "org.freedesktop.sysupdate1.manage-features",
+                details,
+                &t->manager->polkit_registry,
+                error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        /* We write to a file named 50-systemd-sysupdate-enabled.conf, because it's _very_ unlikely that
+         * a sysadmin would name their own config files that in this context. */
+        r = write_drop_in_format(SYSCONF_DIR "/sysupdate.d", feature, 50, "systemd-sysupdate-enabled",
+                                 "# Generated via org.freedesktop.sysupdate1 D-Bus interface\n\n"
+                                 "[Transfer]\n"
+                                 "Enabled=%s\n",
+                                 true_false(enabled));
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(msg, NULL);
+}
+
 static int target_list_components(Target *t, char ***ret_components, bool *ret_have_default) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
         _cleanup_strv_free_ char **components = NULL;
