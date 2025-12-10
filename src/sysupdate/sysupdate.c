@@ -47,6 +47,7 @@ char *arg_root = NULL;
 static char *arg_image = NULL;
 static bool arg_reboot = false;
 static char *arg_component = NULL;
+static char *arg_stream = NULL;
 static int arg_verify = -1;
 static ImagePolicy *arg_image_policy = NULL;
 static bool arg_offline = false;
@@ -56,6 +57,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_definitions, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_component, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_stream, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_transfer_source, freep);
 
@@ -182,7 +184,54 @@ static int context_read_definitions(Context *c, const char* node, bool requires_
 
         if (arg_definitions)
                 dirs = strv_new(arg_definitions);
-        else if (arg_component) {
+        else if (arg_stream) {
+                /* Ultimately we end up with a search path along the lines of: /etc/sysupdate.d/,
+                 * /run/sysupdate.d/, /var/cache/systemd/sysupdate@<stream>.d, /usr/lib/sysupdate@<stream>.d.
+                 * This is very unusual! It seems wrong! But this is the correct behavior. When a
+                 * `systemd-sysupdate --stream=` update is completed, /usr/lib/sysupdate@<stream>.d (or its
+                 * /var/cache alternative) turns into /usr/lib/sysupdate.d, but the admin overrides remain
+                 * untouched. So if we did this any differently, we'd end up in a situation where the admin's
+                 * settings are ignored when first installing a major upgrade but then suddenly considered
+                 * again once the update is completed. In my opinion, that behavior would be more unexpected
+                 * and dangerous than what is implemented here!
+                 *
+                 * Is this a big and surprising footgun for the admin? Yes. But frankly, so is overriding
+                 * anything relating to sysupdate. If an admin has overrides that do anything other than
+                 * turning on/off optional features, they've already aimed a ballistic missile at their
+                 * installation. It'll detonate either immediately when trying to switch streams (as
+                 * implemented now), or when updating to the first patch of the new stream (the alternative);
+                 * the installation is doomed either way. And failing immediately during a major OS upgrade
+                 * seems a lot more preferable, and something that admins will be more prepared for, than a
+                 * subsequent security patch suddenly bricking installations. */
+
+                char **admin = STRV_MAKE(CONF_PATHS_ADMIN("sysupdate.d"));
+                char **system = STRV_MAKE("/var/cache/systemd/", CONF_PATHS_SYSTEM(""));
+                size_t i = 0;
+
+                dirs = new0(char*, strv_length(admin) + strv_length(system) + 1);
+                if (!dirs)
+                        return log_oom();
+
+                STRV_FOREACH(dir, admin) {
+                        char *d;
+
+                        d = strdup(*dir);
+                        if (!d)
+                                return log_oom();
+
+                        dirs[i++] = d;
+                }
+
+                STRV_FOREACH(dir, system) {
+                        char *j;
+
+                        j = strjoin(*dir, "sysupdate@", arg_stream, ".d");
+                        if (!j)
+                                return log_oom();
+
+                        dirs[i++] = j;
+                }
+        } else if (arg_component) {
                 char **l = CONF_PATHS_STRV("");
                 size_t i = 0;
 
@@ -252,6 +301,11 @@ static int context_read_definitions(Context *c, const char* node, bool requires_
                         return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                                "No transfer definitions for component '%s' found.",
                                                arg_component);
+
+                if (arg_stream)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                               "No transfer definitions for stream '%s' found.",
+                                               arg_stream);
 
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                        "No transfer definitions found.");
@@ -1630,6 +1684,116 @@ static int verb_components(int argc, char **argv, void *userdata) {
         return 0;
 }
 
+static int stream_name_valid(const char *s) {
+        _cleanup_free_ char *j = NULL;
+
+        /* See if the specified string enclosed in the directory prefix+suffix would be a valid file name */
+
+        if (isempty(s))
+                return false;
+
+        if (string_has_cc(s, NULL))
+                return false;
+
+        if (!utf8_is_valid(s))
+                return false;
+
+        j = strjoin("sysupdate@", s, ".d");
+        if (!j)
+                return -ENOMEM;
+
+        return filename_is_valid(j);
+}
+
+static int verb_streams(int argc, char **argv, void *userdata) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
+        _cleanup_set_free_ Set *names = NULL;
+        bool has_default_stream = false;
+        int r;
+
+        assert(argc <= 1);
+
+        r = process_image(/* ro= */ false, &mounted_dir, &loop_device);
+        if (r < 0)
+                return r;
+
+        ConfFile **directories = NULL;
+        size_t n_directories = 0;
+
+        CLEANUP_ARRAY(directories, n_directories, conf_file_free_many);
+
+        r = conf_files_list_strv_full(".d", arg_root, CONF_FILES_DIRECTORY, (const char * const *) CONF_PATHS_STRV(""), &directories, &n_directories);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enumerate directories: %m");
+
+        FOREACH_ARRAY(i, directories, n_directories) {
+                ConfFile *e = *i;
+
+                if (streq(e->name, "sysupdate.d")) {
+                        has_default_stream = true;
+                        continue;
+                }
+
+                const char *s = startswith(e->name, "sysupdate@");
+                if (!s)
+                        continue;
+
+                const char *a = endswith(s, ".d");
+                if (!a)
+                        continue;
+
+                _cleanup_free_ char *n = strndup(s, a - s);
+                if (!n)
+                        return log_oom();
+
+                r = stream_name_valid(n);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to validate stream name '%s': %m", n);
+                if (r == 0)
+                        continue;
+
+                r = set_ensure_put(&names, &string_hash_ops_free, n);
+                if (r < 0 && r != -EEXIST)
+                        return log_error_errno(r, "Failed to add stream '%s' to set: %m", n);
+                TAKE_PTR(n);
+        }
+
+        /* We use simple free() rather than strv_free() here, since set_free() will free the strings for us */
+        _cleanup_free_ char **z = set_get_strv(names);
+        if (!z)
+                return log_oom();
+
+        strv_sort(z);
+
+        if (!sd_json_format_enabled(arg_json_format_flags)) {
+                if (!has_default_stream && set_isempty(names)) {
+                        log_info("No streams defined.");
+                        return 0;
+                }
+
+                if (has_default_stream)
+                        printf("%s<default>%s\n",
+                               ansi_highlight(), ansi_normal());
+
+                STRV_FOREACH(i, z)
+                        puts(*i);
+        } else {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+
+                r = sd_json_buildo(&json, SD_JSON_BUILD_PAIR_BOOLEAN("default", has_default_stream),
+                                          SD_JSON_BUILD_PAIR_STRV("streams", z));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create JSON: %m");
+
+                r = sd_json_variant_dump(json, arg_json_format_flags, stdout, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to print JSON: %m");
+        }
+
+        return 0;
+}
+
 static int verb_help(int argc, char **argv, void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
@@ -1643,6 +1807,7 @@ static int verb_help(int argc, char **argv, void *userdata) {
                "\n%3$sCommands:%4$s\n"
                "  list [VERSION]          Show installed and available versions\n"
                "  features [FEATURE]      Show optional features\n"
+               "  streams                 Show alternate streams\n"
                "  check-new               Check if there's a new version available\n"
                "  update [VERSION]        Install new version now\n"
                "  vacuum                  Make room, by deleting old versions\n"
@@ -1655,6 +1820,7 @@ static int verb_help(int argc, char **argv, void *userdata) {
                "\n%3$sOptions:%4$s\n"
                "  -C --component=NAME     Select component to update\n"
                "     --definitions=DIR    Find transfer definitions in specified directory\n"
+               "     --stream=STREAM      Select stream to switch to\n"
                "     --root=PATH          Operate on an alternate filesystem root\n"
                "     --image=PATH         Operate on disk image as filesystem root\n"
                "     --image-policy=POLICY\n"
@@ -1689,6 +1855,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_LEGEND,
                 ARG_SYNC,
                 ARG_DEFINITIONS,
+                ARG_STREAM,
                 ARG_JSON,
                 ARG_ROOT,
                 ARG_IMAGE,
@@ -1705,6 +1872,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "no-pager",          no_argument,       NULL, ARG_NO_PAGER          },
                 { "no-legend",         no_argument,       NULL, ARG_NO_LEGEND         },
                 { "definitions",       required_argument, NULL, ARG_DEFINITIONS       },
+                { "stream",            required_argument, NULL, ARG_STREAM            },
                 { "instances-max",     required_argument, NULL, 'm'                   },
                 { "sync",              required_argument, NULL, ARG_SYNC              },
                 { "json",              required_argument, NULL, ARG_JSON              },
@@ -1759,6 +1927,24 @@ static int parse_argv(int argc, char *argv[]) {
                         r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_definitions);
                         if (r < 0)
                                 return r;
+                        break;
+
+                case ARG_STREAM:
+                        if (isempty(optarg)) {
+                                arg_stream = mfree(arg_stream);
+                                break;
+                        }
+
+                        r = stream_name_valid(optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to determine if stream name is valid: %m");
+                        if (r == 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Stream name invalid: %s", optarg);
+
+                        r = free_and_strdup_warn(&arg_stream, optarg);
+                        if (r < 0)
+                                return r;
+
                         break;
 
                 case ARG_JSON:
@@ -1847,6 +2033,12 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_definitions && arg_component)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --definitions= and --component= switches may not be combined.");
 
+        if (arg_definitions && arg_stream)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --definitions= and --stream= switches may not be combined.");
+
+        if (arg_component && arg_stream)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --component= and --stream= switches may not be combined.");
+
         return 1;
 }
 
@@ -1855,6 +2047,7 @@ static int sysupdate_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
                 { "list",       VERB_ANY, 2, VERB_DEFAULT, verb_list              },
                 { "components", VERB_ANY, 1, 0,            verb_components        },
+                { "streams",    VERB_ANY, 1, 0,            verb_streams           },
                 { "features",   VERB_ANY, 2, 0,            verb_features          },
                 { "check-new",  VERB_ANY, 1, 0,            verb_check_new         },
                 { "update",     VERB_ANY, 2, 0,            verb_update            },
