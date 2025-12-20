@@ -1395,6 +1395,54 @@ static int verb_features(int argc, char **argv, void *userdata) {
         return table_print_with_pager(table, SD_JSON_FORMAT_OFF, arg_pager_flags, false);
 }
 
+static int verb_streams(int argc, char **argv, void *userdata) {
+        sd_bus *bus = ASSERT_PTR(userdata);
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_strv_free_ char **streams = NULL;
+        _cleanup_(table_unrefp) Table *table = NULL;
+        const char *stream, *path;
+        int r;
+
+        assert(bus);
+
+        table = table_new("stream", "bus path");
+        if (!table)
+                return log_oom();
+
+        r = sd_bus_call_method(bus,
+                               bus_sysupdate_mgr->destination,
+                               SYSUPDATE_HOST_PATH,
+                               SYSUPDATE_TARGET_INTERFACE,
+                               "ListAlternateStreams",
+                               &error,
+                               &reply,
+                               "t",
+                               UINT64_C(0));
+        if (r < 0)
+                return log_bus_error(r, &error, "host", "lookup stream");
+
+        r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(so)");
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        while ((r = sd_bus_message_read(reply, "(so)", &stream, &path)) > 0) {
+                r = table_add_many(table,
+                                   TABLE_STRING, stream,
+                                   TABLE_STRING, path);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        r = sd_bus_message_exit_container(reply);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        return table_print_with_pager(table, SD_JSON_FORMAT_OFF, arg_pager_flags, arg_legend);
+}
+
 static int verb_enable(int argc, char **argv, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         bool did_anything = false, enable;
@@ -1489,6 +1537,7 @@ static int help(void) {
                "  check [TARGET...]             Check for updates\n"
                "  update [TARGET[@VERSION]...]  Install updates\n"
                "  vacuum [TARGET...]            Clean up old updates\n"
+               "  streams [STREAM]              List and inspect alternate streams for host OS\n"
                "  features [FEATURE]            List and inspect optional features on host OS\n"
                "  enable FEATURE...             Enable optional feature on host OS\n"
                "  disable FEATURE...            Disable optional feature on host OS\n"
@@ -1593,6 +1642,7 @@ static int run(int argc, char *argv[]) {
                 { "check",    VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY,              verb_check    },
                 { "update",   VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY,              verb_update   },
                 { "vacuum",   VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY,              verb_vacuum   },
+                { "streams",  VERB_ANY, 2,        VERB_ONLINE_ONLY,              verb_streams  },
                 { "features", VERB_ANY, 2,        VERB_ONLINE_ONLY,              verb_features },
                 { "enable",   2,        VERB_ANY, VERB_ONLINE_ONLY,              verb_enable   },
                 { "disable",  2,        VERB_ANY, VERB_ONLINE_ONLY,              verb_enable   },

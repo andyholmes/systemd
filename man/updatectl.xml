@@ -119,6 +119,14 @@
         <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><command>streams</command></term>
+
+        <listitem><para>List the alternate streams available for the host OS.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
