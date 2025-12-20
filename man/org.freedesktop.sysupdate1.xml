@@ -137,6 +137,8 @@ node /org/freedesktop/sysupdate1/target/host {
       SetFeatureEnabled(in  s feature,
                         in  i enabled,
                         in  t flags);
+      ListAlternateStreams(in  t flags,
+                           out a(so) streams);
     properties:
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s Class = '...';
@@ -176,6 +178,8 @@ node /org/freedesktop/sysupdate1/target/host {
     <variablelist class="dbus-method" generated="True" extra-ref="DescribeFeature()"/>
 
     <variablelist class="dbus-method" generated="True" extra-ref="SetFeatureEnabled()"/>
+
+    <variablelist class="dbus-method" generated="True" extra-ref="ListAlternateStreams()"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="Class"/>
 
@@ -352,6 +356,10 @@ node /org/freedesktop/sysupdate1/target/host {
       version, or it can extend the newest existing installation in-place (by passing in the version returned
       by <varname>GetVersion()</varname>).
       For now, this method only works with the <literal>host</literal> target.</para>
+
+      <para><function>ListAlternateStreams()</function> returns a list of this target's alternate streams,
+      by name and object path. The <varname>flags</varname> argument is added for future extensibility, and
+      must be set to 0. If the target has no alternate streams, the method returns an empty array.</para>
 
     </refsect2>
 

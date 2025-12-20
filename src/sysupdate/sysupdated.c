@@ -1438,6 +1438,74 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
         return sd_bus_reply_method_return(msg, NULL);
 }
 
+static int target_method_list_alternate_streams(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        _cleanup_strv_free_ char **streams = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        Target *t = ASSERT_PTR(userdata);
+        sd_json_variant *v;
+        uint64_t flags;
+        int r;
+
+        assert(msg);
+
+        r = sd_bus_message_read(msg, "t", &flags);
+        if (r < 0)
+                return r;
+        if (flags != 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
+
+        r = sysupdate_run_simple(&json, t, "streams", NULL);
+        if (r < 0)
+                return r;
+
+        v = sd_json_variant_by_key(json, "streams");
+        if (!v)
+                return -EINVAL;
+        r = sd_json_variant_strv(v, &streams);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_new_method_return(msg, &reply);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(reply, 'a', "(so)");
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(stream, streams) {
+                _cleanup_free_ char *stream_esc = NULL;
+                _cleanup_free_ char *target_esc = NULL;
+                _cleanup_free_ char *bus_path = NULL;
+
+                target_esc = bus_label_escape(t->id);
+                if (!target_esc)
+                        return -ENOMEM;
+
+                stream_esc = bus_label_escape(*stream);
+                if (!stream_esc)
+                        return -ENOMEM;
+
+                bus_path = strjoin("/org/freedesktop/sysupdate1/target/", target_esc,
+                                   "/stream/", stream_esc);
+                if (!bus_path)
+                        return -ENOMEM;
+
+                r = sd_bus_message_append(reply, "(so)",
+                                          *stream,
+                                          bus_path);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_bus_message_close_container(reply);
+        if (r < 0)
+                return r;
+
+        return sd_bus_message_send(reply);
+}
+
 static int target_list_components(Target *t, char ***ret_components, bool *ret_have_default) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
         _cleanup_strv_free_ char **components = NULL;
@@ -1608,6 +1676,12 @@ static const sd_bus_vtable target_vtable[] = {
                                 SD_BUS_ARGS("t", flags),
                                 SD_BUS_RESULT("as", features),
                                 target_method_list_features,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("ListAlternateStreams",
+                                SD_BUS_ARGS("t", flags),
+                                SD_BUS_RESULT("a(so)", streams),
+                                target_method_list_alternate_streams,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_METHOD_WITH_ARGS("DescribeFeature",
