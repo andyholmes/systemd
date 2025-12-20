@@ -86,6 +86,7 @@ assert_cc((int) _IMAGE_CLASS_MAX == (int) _TARGET_CLASS_IS_IMAGE_CLASS_MAX);
 
 typedef struct Target {
         Manager *manager;
+        Hashmap *streams;
 
         TargetClass class;
         char *name;
@@ -95,6 +96,13 @@ typedef struct Target {
         ImageType image_type;
         bool busy;
 } Target;
+
+typedef struct Stream {
+        Target *target;
+        char *name;
+        char *path;
+        char *id;
+} Stream;
 
 typedef enum JobType {
         JOB_LIST,
@@ -710,6 +718,7 @@ static Target *target_free(Target *t) {
         free(t->name);
         free(t->path);
         free(t->id);
+        hashmap_free(t->streams);
 
         return mfree(t);
 }
@@ -1536,6 +1545,36 @@ static int target_list_components(Target *t, char ***ret_components, bool *ret_h
         return 0;
 }
 
+static int target_list_streams(Target *t, char ***ret_streams, bool *ret_have_default) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        _cleanup_strv_free_ char **streams = NULL;
+        sd_json_variant *v;
+        bool have_default;
+        int r;
+
+        r = sysupdate_run_simple(&json, t, "streams", NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to run 'systemd-sysupdate streams': %m");
+
+        v = sd_json_variant_by_key(json, "default");
+        if (!v)
+                return log_sysupdate_bad_json_debug(SYNTHETIC_ERRNO(EPROTO), "streams", "Missing key 'default'");
+        have_default = sd_json_variant_boolean(v);
+
+        v = sd_json_variant_by_key(json, "streams");
+        if (!v)
+                return log_sysupdate_bad_json_debug(SYNTHETIC_ERRNO(EPROTO), "streams", "Missing key 'streams'");
+        r = sd_json_variant_strv(v, &streams);
+        if (r < 0)
+                return log_sysupdate_bad_json_debug(SYNTHETIC_ERRNO(EPROTO), "streams", "Key 'streams' should be a strv");
+
+        if (ret_streams)
+                *ret_streams = TAKE_PTR(streams);
+        if (ret_have_default)
+                *ret_have_default = have_default;
+        return 0;
+}
+
 static int manager_ensure_targets(Manager *m);
 
 static int target_object_find(
@@ -1704,6 +1743,326 @@ static const BusObjectImplementation target_object = {
         "org.freedesktop.sysupdate1.Target",
         .fallback_vtables = BUS_FALLBACK_VTABLES({target_vtable, target_object_find}),
         .node_enumerator = target_node_enumerator,
+};
+
+static Stream *stream_free(Stream *s) {
+        if (!s)
+                return NULL;
+
+        free(s->name);
+        free(s->path);
+        free(s->id);
+
+        return mfree(s);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Stream*, stream_free);
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(stream_hash_ops, char, string_hash_func, string_compare_func,
+                                      Stream, stream_free);
+
+static int stream_new(Manager *m, Target *t, const char *name, const char *path, Stream **ret) {
+        _cleanup_(stream_freep) Stream *s = NULL;
+
+        assert(m);
+        assert(ret);
+
+        s = new(Stream, 1);
+        if (!s)
+                return -ENOMEM;
+
+        *s = (Stream) {
+                .target = t,
+        };
+
+        s->name = strdup(name);
+        if (!s->name)
+                return -ENOMEM;
+
+        s->path = strdup(path);
+        if (!s->path)
+                return -ENOMEM;
+
+        s->id = t ? strjoin(t->id, ":", name) : strdup (name);
+        if (!s->id)
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(s);
+        return 0;
+}
+
+static int stream_property_get_target_path(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Stream *s = ASSERT_PTR(userdata);
+        _cleanup_free_ char *target_path = NULL;
+
+        if (s->target)
+                target_path = target_bus_path(s->target);
+        else
+                target_path = strdup("/org/freedesktop/sysupdate1/target/host");
+
+        if (!target_path)
+                return -ENOMEM;
+
+        return sd_bus_message_append(reply, "o", target_path);
+}
+
+static int stream_method_list(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_list(msg, s->target, error);
+}
+
+static int stream_method_describe(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_describe(msg, s->target, error);
+}
+
+static int stream_method_check_new(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_check_new(msg, s->target, error);
+}
+
+static int stream_method_update(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_update(msg, s->target, error);
+}
+
+static int stream_method_vacuum(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_vacuum(msg, s->target, error);
+}
+
+static int stream_method_get_appstream(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_get_appstream(msg, s->target, error);
+}
+
+static int stream_method_get_version(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_get_version(msg, s->target, error);
+}
+
+static int stream_method_list_features(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_list_features(msg, s->target, error);
+}
+
+static int stream_method_describe_feature(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_describe_feature(msg, s->target, error);
+}
+
+static int stream_method_set_feature_enabled(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Stream *s = ASSERT_PTR(userdata);
+        return target_method_set_feature_enabled(msg, s->target, error);
+}
+
+static int stream_object_find(
+                sd_bus *bus,
+                const char *path,
+                const char *iface,
+                void *userdata,
+                void **found,
+                sd_bus_error *error) {
+
+        Manager *m = ASSERT_PTR(userdata);
+        Target *t;
+        Stream *s;
+        const char *p, *slash;
+        _cleanup_free_ char *target_esc = NULL;
+        _cleanup_free_ char *target_id = NULL;
+        _cleanup_free_ char *stream_name = NULL;
+        int r;
+
+        assert(bus);
+        assert(path);
+        assert(found);
+
+        p = startswith(path, "/org/freedesktop/sysupdate1/target/");
+        if (!p)
+                return 0;
+
+        slash = strstr(p, "/stream/");
+        if (!slash)
+                return 0;
+
+        r = manager_ensure_targets(m);
+        if (r < 0)
+                return r;
+
+        target_esc = strndup(p, slash - p);
+        if (!target_esc)
+                return -ENOMEM;
+
+        target_id = bus_label_unescape(target_esc);
+        if (!target_id)
+                return -ENOMEM;
+
+        t = hashmap_get(m->targets, target_id);
+        if (!t)
+                return 0;
+
+        stream_name = bus_label_unescape(slash + strlen("/stream/"));
+        if (!stream_name)
+                return -ENOMEM;
+
+        s = hashmap_get(t->streams, stream_name);
+        if (!s)
+                return 0;
+
+        *found = s;
+        return 1;
+}
+
+static char *stream_bus_path(Stream *s) {
+        _cleanup_free_ char *target_path = NULL;
+        _cleanup_free_ char *stream_esc = NULL;
+
+        assert(s);
+        assert(s->target);
+
+        target_path = target_bus_path(s->target);
+        if (!target_path)
+                return NULL;
+
+        stream_esc = bus_label_escape(s->name);
+        if (!stream_esc)
+                return NULL;
+
+        return strjoin(target_path, "/stream/", stream_esc);
+}
+
+static int stream_node_enumerator(
+                sd_bus *bus,
+                const char *path,
+                void *userdata,
+                char ***nodes,
+                sd_bus_error *error) {
+
+        _cleanup_strv_free_ char **l = NULL;
+        _cleanup_free_ char *target_id = NULL;
+        Manager *m = ASSERT_PTR(userdata);
+        Target *t;
+        Stream *s;
+        const char *p;
+        unsigned k = 0;
+        int r;
+
+        p = startswith(path, "/org/freedesktop/sysupdate1/target/");
+        if (!p)
+                return 0;
+
+        r = manager_ensure_targets(m);
+        if (r < 0)
+                return r;
+
+        target_id = bus_label_unescape(p);
+        if (!target_id)
+                return -ENOMEM;
+
+        t = hashmap_get(m->targets, target_id);
+        if (!t)
+                return 0;
+
+        l = new0(char*, hashmap_size(t->streams) + 1);
+        if (!l)
+                return -ENOMEM;
+
+        HASHMAP_FOREACH(s, t->streams) {
+                l[k] = stream_bus_path(s);
+                if (!l[k])
+                        return -ENOMEM;
+                k++;
+        }
+
+        *nodes = TAKE_PTR(l);
+        return 1;
+}
+
+static const sd_bus_vtable stream_vtable[] = {
+        SD_BUS_VTABLE_START(0),
+
+        SD_BUS_PROPERTY("Name", "s", NULL, offsetof(Stream, name),
+                        SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Path", "s", NULL, offsetof(Stream, path),
+                        SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Target", "o", stream_property_get_target_path, 0,
+                        SD_BUS_VTABLE_PROPERTY_CONST),
+
+        SD_BUS_METHOD_WITH_ARGS("List",
+                                SD_BUS_ARGS("t", flags),
+                                SD_BUS_RESULT("as", versions),
+                                stream_method_list,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("Describe",
+                                SD_BUS_ARGS("s", version, "t", flags),
+                                SD_BUS_RESULT("s", json),
+                                stream_method_describe,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("CheckNew",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("s", new_version),
+                                stream_method_check_new,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("Update",
+                                SD_BUS_ARGS("s", new_version, "t", flags),
+                                SD_BUS_RESULT("s", new_version, "t", job_id, "o", job_path),
+                                stream_method_update,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("Vacuum",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("u", instances, "u", disabled_transfers),
+                                stream_method_vacuum,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("GetAppStream",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("as", appstream),
+                                stream_method_get_appstream,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("GetVersion",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("s", version),
+                                stream_method_get_version,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("ListFeatures",
+                                SD_BUS_ARGS("t", flags),
+                                SD_BUS_RESULT("as", features),
+                                stream_method_list_features,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("DescribeFeature",
+                                SD_BUS_ARGS("s", feature, "t", flags),
+                                SD_BUS_RESULT("s", json),
+                                stream_method_describe_feature,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_ARGS("SetFeatureEnabled",
+                                SD_BUS_ARGS("s", feature, "i", enabled, "t", flags),
+                                SD_BUS_NO_RESULT,
+                                stream_method_set_feature_enabled,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_VTABLE_END
+};
+
+static const BusObjectImplementation stream_object = {
+        "/org/freedesktop/sysupdate1/target",
+        "org.freedesktop.sysupdate1.Stream",
+        .fallback_vtables = BUS_FALLBACK_VTABLES({stream_vtable, stream_object_find}),
+        .node_enumerator = stream_node_enumerator,
 };
 
 static Manager *manager_free(Manager *m) {
@@ -1904,6 +2263,42 @@ static int manager_enumerate_components(Manager *m) {
         return 0;
 }
 
+static int manager_enumerate_streams(Manager *m) {
+        _cleanup_strv_free_ char **streams = NULL;
+        Target *t = NULL;
+        bool have_default;
+        int r;
+
+        r = target_list_streams(NULL, &streams, &have_default);
+        if (r < 0)
+                return r;
+
+        if (have_default)
+                t = hashmap_get(m->targets, "host");
+        if (!t)
+                return 0;
+
+        STRV_FOREACH(stream, streams) {
+                _cleanup_free_ char *path = NULL;
+                _cleanup_(stream_freep) Stream *s = NULL;
+
+                path = strjoin("sysupdate@", *stream, ".d");
+                if (!path)
+                        return -ENOMEM;
+
+                r = stream_new(m, t, *stream, path, &s);
+                if (r < 0)
+                        return r;
+
+                r = hashmap_ensure_put(&t->streams, &stream_hash_ops, s->name, s);
+                if (r < 0)
+                        return r;
+                TAKE_PTR(s);
+        }
+
+        return 0;
+}
+
 static int manager_enumerate_targets(Manager *m) {
         static const TargetClass discoverable_classes[] = {
                 TARGET_MACHINE,
@@ -1925,6 +2320,10 @@ static int manager_enumerate_targets(Manager *m) {
         r = manager_enumerate_components(m);
         if (r < 0)
                 log_warning_errno(r, "Failed to enumerate components, ignoring: %m");
+
+        r = manager_enumerate_streams(m);
+        if (r < 0)
+                log_warning_errno(r, "Failed to enumerate streams, ignoring: %m");
 
         return 0;
 }
@@ -2081,7 +2480,7 @@ static const BusObjectImplementation manager_object = {
         "/org/freedesktop/sysupdate1",
         "org.freedesktop.sysupdate1.Manager",
         .vtables = BUS_VTABLES(manager_vtable),
-        .children = BUS_IMPLEMENTATIONS(&job_object, &target_object),
+        .children = BUS_IMPLEMENTATIONS(&job_object, &target_object, &stream_object),
 };
 
 static int manager_add_bus_objects(Manager *m) {
